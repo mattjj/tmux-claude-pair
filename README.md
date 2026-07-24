@@ -202,7 +202,7 @@ Useful flags (pass them to `claude-pair`; they're forwarded to the watcher):
 | `--context-budget` | `120000` | max chars loaded per context path |
 | `--away` | `60` | minutes of inactivity before a welcome-back recap (0 = off) |
 | `--journal-every` | `30` | minutes of work per journal checkpoint (0 = journaling off) |
-| `--model` | `claude-opus-4-8` | any Claude model id (`CLAUDE_PAIR_MODEL` env var also works) |
+| `--model` | `claude-opus-5` | any Claude model id (`CLAUDE_PAIR_MODEL` env var also works) |
 | `--effort` | `low` | reasoning effort per suggestion; raise for deeper reviews |
 | `--think` | off | let the model think before answering (deeper, slower) |
 | `--fast` | off | Opus 4.8/4.7 fast mode (~2.5x speed, premium; needs account access) |
@@ -295,8 +295,9 @@ model thinking, and model speed:
   tool rarely needs the model to reason first, and skipping it cuts the pause
   before the first token — especially on the common SKIP. `--think` turns it
   back on for a deeper (slower) session.
-- **`--fast`** turns on Opus 4.8's fast mode (~2.5× output speed, premium
-  price). Opus 4.8/4.7 only, and it needs **fast-mode access on your
+- **`--fast`** turns on Opus fast mode (~2.5× output speed, premium price).
+  Opus 4.8/4.7 only — the default Opus 5 doesn't support it, so pair it with
+  `--model claude-opus-4-8`. It also needs **fast-mode access on your
   account** — without it the watcher notices (a permission error), prints a
   note, and quietly stays on standard speed for the session. If your account
   *does* have it and you hit fast mode's separate rate limit, it

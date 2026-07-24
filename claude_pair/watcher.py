@@ -28,7 +28,7 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
 
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-opus-5"
 
 CACHE_DIR = (
     Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-pair"
@@ -846,6 +846,10 @@ def watch(args: argparse.Namespace) -> None:
     if args.fast and args.model not in ("claude-opus-4-8", "claude-opus-4-7"):
         printer.note(f"--fast needs Opus 4.8/4.7; ignoring it for {args.model}")
         args.fast = False
+    if args.model == "claude-opus-5" and not args.think and args.effort in ("xhigh", "max"):
+        # Opus 5 rejects thinking-disabled at xhigh/max effort (400)
+        printer.note(f"effort {args.effort} on {args.model} requires thinking; enabling it")
+        args.think = True
     mode = "pinned to" if args.pin else "following active pane, starting at"
     flags = []
     if args.fast:

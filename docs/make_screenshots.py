@@ -41,7 +41,7 @@ def shell(*lines: str) -> Text:
 
 def watcher_pane(*chunks) -> Group:
     header = [
-        Text("claude-pair watching %0 (model=claude-opus-4-8, ...)", style="dim"),
+        Text("claude-pair watching %0 (model=claude-opus-5, ...)", style="dim"),
         Text("talk to me: type here + Enter, `claude-pair say ...`,", style="dim"),
         Text("or `# claude: ...` in your shell", style="dim"),
     ]
