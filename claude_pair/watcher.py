@@ -637,7 +637,6 @@ class Suggester:
         self.args = args
         self.printer = printer
         self.own_pane = os.environ.get("TMUX_PANE")
-        self.fast_paused_until = 0.0  # monotonic time until which fast is skipped
         self.messages: list[dict] = []
 
     def _trim_history(self) -> None:
@@ -723,38 +722,11 @@ class Suggester:
             messages=self.messages,
         )
 
-        use_fast = self.args.fast and time.monotonic() >= self.fast_paused_until
-        if use_fast:
-            try:
-                self._stream(kwargs, use_fast=True)
-                return
-            except self.anthropic.RateLimitError:
-                # fast pool exhausted: back off fast temporarily
-                self.fast_paused_until = time.monotonic() + self.args.fast_backoff
-                self.printer.note(
-                    f"[fast mode rate-limited; standard speed for "
-                    f"{self.args.fast_backoff:g}s]"
-                )
-            except (
-                self.anthropic.PermissionDeniedError,
-                self.anthropic.BadRequestError,
-            ) as exc:
-                # not approved / unsupported: stop trying fast this session
-                self.args.fast = False
-                self.printer.note(
-                    f"[fast mode unavailable ({exc.status_code}); "
-                    "standard speed for the rest of this session]"
-                )
-            # fall through and retry this suggestion at standard speed
-        self._stream(kwargs, use_fast=False)
+        self._stream(kwargs)
 
-    def _stream(self, base_kwargs: dict, use_fast: bool) -> None:
+    def _stream(self, base_kwargs: dict) -> None:
         kwargs = dict(base_kwargs)
         stream_fn = self.client.messages.stream
-        if use_fast:  # Opus 4.8/4.7 fast mode: ~2.5x tok/s, premium price
-            stream_fn = self.client.beta.messages.stream
-            kwargs["speed"] = "fast"
-            kwargs["betas"] = ["fast-mode-2026-02-01"]
 
         buffered = ""
         live: Live | None = None
@@ -843,21 +815,15 @@ def extract_code(reply: str) -> str:
 
 def watch(args: argparse.Namespace) -> None:
     printer = Printer()
-    if args.fast and args.model not in ("claude-opus-4-8", "claude-opus-4-7"):
-        printer.note(f"--fast needs Opus 4.8/4.7; ignoring it for {args.model}")
-        args.fast = False
     if args.model == "claude-opus-5" and not args.think and args.effort in ("xhigh", "max"):
         # Opus 5 rejects thinking-disabled at xhigh/max effort (400)
         printer.note(f"effort {args.effort} on {args.model} requires thinking; enabling it")
         args.think = True
     mode = "pinned to" if args.pin else "following active pane, starting at"
-    flags = []
-    if args.fast:
-        flags.append("fast")
-    flags.append("thinking" if args.think else "no-think")
+    think = "thinking" if args.think else "no-think"
     printer.banner(
         f"claude-pair {mode} {args.target} "
-        f"(model={args.model}, effort={args.effort}, {', '.join(flags)}, "
+        f"(model={args.model}, effort={args.effort}, {think}, "
         f"debounce={args.debounce}s)"
     )
     printer.banner(
@@ -1257,19 +1223,6 @@ def main() -> None:
         default=False,
         help="let the model think before answering (slower, sometimes deeper; "
         "default off for snappier first-token latency)",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="Opus 4.8/4.7 fast mode: ~2.5x output speed at premium pricing "
-        "(requires fast-mode access on your account)",
-    )
-    parser.add_argument(
-        "--fast-backoff",
-        type=float,
-        default=60.0,
-        help="after a fast-mode rate limit, use standard speed for this many "
-        "seconds before trying fast again (default 60)",
     )
     parser.add_argument(
         "--timing",

@@ -205,8 +205,6 @@ Useful flags (pass them to `claude-pair`; they're forwarded to the watcher):
 | `--model` | `claude-opus-5` | any Claude model id (`CLAUDE_PAIR_MODEL` env var also works) |
 | `--effort` | `low` | reasoning effort per suggestion; raise for deeper reviews |
 | `--think` | off | let the model think before answering (deeper, slower) |
-| `--fast` | off | Opus 4.8/4.7 fast mode (~2.5x speed, premium; needs account access) |
-| `--fast-backoff` | `60` | seconds at standard speed after a fast-mode rate limit |
 | `--timing` | off | print time-to-first-token and total per call |
 | `--theme` | `monokai` | pygments theme for code blocks (`dracula`, `ansi_dark`, …) |
 | `--debounce` | `0.25` | seconds of quiet after a change before asking Claude |
@@ -295,24 +293,13 @@ model thinking, and model speed:
   tool rarely needs the model to reason first, and skipping it cuts the pause
   before the first token — especially on the common SKIP. `--think` turns it
   back on for a deeper (slower) session.
-- **`--fast`** turns on Opus fast mode (~2.5× output speed, premium price).
-  Opus 4.8/4.7 only — the default Opus 5 doesn't support it, so pair it with
-  `--model claude-opus-4-8`. It also needs **fast-mode access on your
-  account** — without it the watcher notices (a permission error), prints a
-  note, and quietly stays on standard speed for the session. If your account
-  *does* have it and you hit fast mode's separate rate limit, it
-  auto-falls-back to standard for `--fast-backoff` seconds (default 60),
-  retrying the current suggestion right away, then re-probes fast. Either
-  way, fast trouble degrades instead of stalling.
 - **`--timing`** prints `⧗ 0.9s→first · 1.4s total` after each call. If
   time-to-first-token is high, it's the network (a tether, a train); if TTFT
-  is low but total is high, it's generation — try `--fast` or a smaller
-  model.
+  is low but total is high, it's generation — try a lower effort or a
+  smaller model.
 
 Snappiest of all is just a faster model — `--model claude-haiku-4-5` is still
-Claude, and dramatically quicker for this kind of quick-take task. `--fast`
-keeps Opus's judgement and pays for speed, if your account has fast-mode
-access.
+Claude, and dramatically quicker for this kind of quick-take task.
 
 ## Cost note
 
