@@ -40,11 +40,35 @@ function! s:WriteState() abort
   call writefile([json_encode(l:state)], s:state_file)
 endfunction
 
+" ring of recently edited files; the watcher auto-loads their saved
+" contents as reference context (claude-pair --vim-files N, default 5)
+let g:claude_pair_recent_files = get(g:, 'claude_pair_recent_files', 10)
+let s:recent_file = s:state_dir . '/vim_recent.json'
+let s:recent = []
+
+function! s:TrackRecent() abort
+  if !g:claude_pair_enabled || empty(expand('%')) || !empty(&buftype)
+        \ || g:claude_pair_recent_files <= 0
+    return
+  endif
+  let l:path = expand('%:p')
+  call filter(s:recent, 'v:val !=# l:path')
+  call insert(s:recent, l:path, 0)
+  if len(s:recent) > g:claude_pair_recent_files
+    call remove(s:recent, g:claude_pair_recent_files, -1)
+  endif
+  if !isdirectory(s:state_dir)
+    call mkdir(s:state_dir, 'p')
+  endif
+  call writefile([json_encode(s:recent)], s:recent_file)
+endfunction
+
 augroup ClaudePair
   autocmd!
   " CursorHold fires after 'updatetime' ms of idleness; consider
   " `set updatetime=1000` so state stays fresh while you pause.
   autocmd CursorHold,CursorHoldI,BufEnter,BufWritePost,InsertLeave * call s:WriteState()
+  autocmd BufEnter,BufWritePost * call s:TrackRecent()
 augroup END
 
 command! ClaudePairToggle let g:claude_pair_enabled = !g:claude_pair_enabled

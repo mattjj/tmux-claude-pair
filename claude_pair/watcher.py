@@ -34,7 +34,16 @@ CACHE_DIR = (
     Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-pair"
 )
 VIM_STATE_FILE = CACHE_DIR / "vim_state.json"
+VIM_RECENT_FILE = CACHE_DIR / "vim_recent.json"  # ring of recent vim files
 VIM_STATE_MAX_AGE = 120  # seconds before vim state is considered stale
+
+# never auto-load files whose names suggest secrets; explicit
+# `claude-pair context add` remains available for deliberate loading
+SENSITIVE_NAME_RE = re.compile(
+    r"(^\.env($|\.)|secret|credential|token|password|\.pem$|\.key$"
+    r"|id_rsa|id_ed25519|id_ecdsa|\.netrc$|_history$|\.kdbx$)",
+    re.IGNORECASE,
+)
 INBOX_DIR = CACHE_DIR / "inbox"  # `claude-pair say` drops messages here
 LAST_SUGGESTION_FILE = CACHE_DIR / "last_suggestion.txt"
 LAST_CODE_FILE = CACHE_DIR / "last_code.txt"  # just the fenced code blocks
@@ -71,7 +80,10 @@ The user works in fish shell and vim on Linux. Tailor suggestions accordingly \
 A <reference_context> block, when present, holds files or code the user \
 loaded for you to consult — background knowledge for understanding what \
 they're doing, not something to review or comment on line by line. Use it to \
-inform your suggestions about the pane and editor.
+inform your suggestions about the pane and editor. A <vim_recent_files> \
+block is similar but automatic: the full saved contents of files they \
+recently edited in vim. Where a snapshot's <vim> cursor block disagrees \
+with it, the cursor block shows unsaved edits and wins.
 
 Respond with exactly SKIP unless you have something genuinely worth \
 interrupting for, such as:
@@ -501,6 +513,59 @@ def pane_cmd(argv: list[str], width: int = 60) -> None:
         report("✻ claude-pair shown")
 
 
+def read_recent_vim_files(limit: int) -> list[Path]:
+    try:
+        paths = json.loads(VIM_RECENT_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(paths, list):
+        return []
+    return [Path(p) for p in paths[:limit] if isinstance(p, str)]
+
+
+def vim_context_signature(limit: int) -> tuple:
+    """Cheap per-loop fingerprint: rebuild only when a tracked file changes."""
+    sig = []
+    for p in read_recent_vim_files(limit):
+        try:
+            st = p.stat()
+            sig.append((str(p), int(st.st_mtime), st.st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
+def build_vim_context(limit: int, budget: int) -> str:
+    """Full saved contents of recently edited vim files, budget-guarded."""
+    parts: list[str] = []
+    used = 0
+    skipped: list[str] = []
+    for p in read_recent_vim_files(limit):
+        if SENSITIVE_NAME_RE.search(p.name):
+            continue  # never auto-load likely-secret files
+        text = _read_text_file(p)
+        if text is None:
+            continue
+        chunk = f"=== {p} ===\n{text}\n"
+        if used + len(chunk) > budget:
+            skipped.append(p.name)
+            continue
+        parts.append(chunk)
+        used += len(chunk)
+    if not parts:
+        return ""
+    note = (
+        f"\n(budget hit: {', '.join(skipped)} not included)" if skipped else ""
+    )
+    return (
+        "<vim_recent_files>\nFull contents, as last saved, of files the user "
+        "recently edited in vim (most recent first). Unsaved edits appear in "
+        f"each snapshot's <vim> block instead.{note}\n\n"
+        + "\n".join(parts)
+        + "</vim_recent_files>"
+    )
+
+
 def read_vim_state() -> dict | None:
     try:
         stat = VIM_STATE_FILE.stat()
@@ -647,8 +712,11 @@ class Suggester:
             while self.messages and self.messages[0]["role"] != "user":
                 self.messages.pop(0)
 
-    def suggest(self, snapshot: str, context_text: str = "") -> None:
+    def suggest(
+        self, snapshot: str, context_text: str = "", vim_context: str = ""
+    ) -> None:
         self.context_text = context_text
+        self.vim_context = vim_context
         self.messages.append({"role": "user", "content": snapshot})
         self._trim_history()
         try:
@@ -668,12 +736,20 @@ class Suggester:
             time.sleep(5)
 
     def _system(self) -> list[dict]:
-        # System = frozen prompt + (optional) loaded reference context, cached
-        # together as a stable prefix ahead of the volatile snapshots.
+        # System = frozen prompt + (optional) manually loaded context, then
+        # (optional) auto vim-files context. The vim block changes on every
+        # save, so it gets its own trailing cache breakpoint — a save
+        # re-caches only that block, not the prompt/manual prefix.
         system = [{"type": "text", "text": SYSTEM_PROMPT}]
         if getattr(self, "context_text", ""):
             system.append({"type": "text", "text": self.context_text})
         system[-1]["cache_control"] = {"type": "ephemeral"}
+        if getattr(self, "vim_context", ""):
+            system.append({
+                "type": "text",
+                "text": self.vim_context,
+                "cache_control": {"type": "ephemeral"},
+            })
         return system
 
     def journal_stretch(self, reason: str) -> None:
@@ -856,6 +932,13 @@ def watch(args: argparse.Namespace) -> None:
     if context_text:
         printer.banner(f"context: {len(context_text)} chars loaded")
 
+    vim_sig = vim_context_signature(args.vim_files)
+    vim_context = build_vim_context(args.vim_files, args.context_budget)
+    if vim_context:
+        nfiles = len(read_recent_vim_files(args.vim_files))
+        printer.banner(f"vim context: {nfiles} recent file(s), "
+                       f"{len(vim_context)} chars")
+
     own_pane = os.environ.get("TMUX_PANE")
     if own_pane:  # let `claude-pair hide/show/toggle` find this watcher
         try:
@@ -965,6 +1048,17 @@ def watch(args: argparse.Namespace) -> None:
                 if context_text else "→ context cleared"
             )
 
+        # refresh auto vim-files context when a tracked file is saved or the
+        # recent-files ring changes; banner only when the *set* changes
+        new_vim_sig = vim_context_signature(args.vim_files)
+        if new_vim_sig != vim_sig:
+            old_paths = {entry[0] for entry in vim_sig}
+            vim_sig = new_vim_sig
+            vim_context = build_vim_context(args.vim_files, args.context_budget)
+            if {entry[0] for entry in new_vim_sig} != old_paths:
+                nfiles = len(read_recent_vim_files(args.vim_files))
+                printer.banner(f"→ vim context: {nfiles} recent file(s)")
+
         # direct messages jump the queue: no debounce, no cooldown
         direct = poll_inbox()
         while not stdin_inbox.empty():
@@ -1001,9 +1095,11 @@ def watch(args: argparse.Namespace) -> None:
                 printer.divider()
                 if context_text:
                     printer.stream(f"[+{len(context_text)} chars context]\n")
+                if vim_context:
+                    printer.stream(f"[+{len(vim_context)} chars vim context]\n")
                 printer.stream(snapshot + "\n")
             else:
-                suggester.suggest(snapshot, context_text)
+                suggester.suggest(snapshot, context_text, vim_context)
                 suggest_calls += 1
 
         time.sleep(args.interval)
@@ -1207,6 +1303,14 @@ def main() -> None:
         type=int,
         default=DEFAULT_CONTEXT_BUDGET,
         help=f"max chars to load per path (default {DEFAULT_CONTEXT_BUDGET})",
+    )
+    parser.add_argument(
+        "--vim-files",
+        type=int,
+        default=5,
+        metavar="N",
+        help="auto-load the full saved contents of the last N files edited "
+        "in vim as reference context (default 5; 0 disables)",
     )
     parser.add_argument(
         "--model", default=os.environ.get("CLAUDE_PAIR_MODEL", DEFAULT_MODEL)

@@ -137,6 +137,27 @@ Three ways to ask it something directly (direct messages are always answered
   last commit?` at the prompt — in fish that's a no-op comment, but the
   watcher sees it on screen and answers it once.
 
+### Vim files are loaded automatically
+
+With the vim plugin installed, the watcher automatically keeps the **full
+saved contents of your last 5 vim files** (current file included) in Claude's
+context — no manual loading. Details that matter:
+
+- Contents are read **from disk on save**, not from the buffer per
+  keystroke — so the prompt cache is only invalidated when you `:w`, and
+  the loaded files bill at ~10% cached rates between saves. Unsaved edits
+  are still visible to Claude via the cursor-region block in each snapshot.
+- `--vim-files N` tunes the count (`0` disables);
+  `let g:claude_pair_recent_files = 20` sets how many vim remembers.
+- Files with secret-looking names (`.env*`, `*secret*`, `*credential*`,
+  `*token*`, `*.pem`, `id_rsa`, `*_history`, …) are **never auto-loaded**.
+  Use `claude-pair context add` if you genuinely want one loaded.
+- The total rides under `--context-budget`; overflow files are skipped
+  with a note, never silently.
+
+`:ClaudeContext` (`<leader>cc`) still exists for pinning a file into the
+*manual* context store — useful for reference files you're not editing.
+
 ### Loading extra context
 
 Give Claude reference material to consult — the file you're working in, or a
@@ -200,6 +221,7 @@ Useful flags (pass them to `claude-pair`; they're forwarded to the watcher):
 | `--no-notify` | on | disable the tmux status-line ping when you're on another window |
 | `--context PATH` | — | file/dir to load as reference context (repeatable) |
 | `--context-budget` | `120000` | max chars loaded per context path |
+| `--vim-files` | `5` | auto-load the last N vim files' saved contents (0 = off) |
 | `--away` | `60` | minutes of inactivity before a welcome-back recap (0 = off) |
 | `--journal-every` | `30` | minutes of work per journal checkpoint (0 = journaling off) |
 | `--model` | `claude-opus-5` | any Claude model id (`CLAUDE_PAIR_MODEL` env var also works) |
