@@ -260,6 +260,13 @@ still failing, that command half-typed), and a suggested next step — drawn
 from its memory of your last snapshots before the break. Tune with
 `--away MINUTES` (default 60; `0` disables).
 
+This also works across restarts: **open claude-pair fresh on Monday morning**
+(or after a few hours away) and, if the journal's last entry is older than
+the `--away` threshold, it immediately prints a *"✻ where you left off
+(2 days ago)"* section with your last few journal entries — instantly, before
+any activity, no API call. Your first real snapshot then gets a synthesized
+recap on top, grounded in the journal plus whatever's on screen now.
+
 Away time is measured by your last real tmux keypress (`#{client_activity}`),
 so background output landing in a pane while you're gone doesn't count as
 "you're back" — and it's wall-clock based, so suspending your laptop counts

@@ -180,6 +180,47 @@ def journal_tail(lines: int = 30) -> str:
     return "\n".join(content.splitlines()[-lines:]).strip()
 
 
+def journal_age_minutes() -> float | None:
+    """Minutes since the last journal entry (file mtime), or None if none."""
+    try:
+        return (time.time() - JOURNAL_FILE.stat().st_mtime) / 60
+    except OSError:
+        return None
+
+
+def journal_last_section(entries: int = 5) -> str:
+    """Markdown of the last few journal entries, with their date header."""
+    try:
+        lines = JOURNAL_FILE.read_text().splitlines()
+    except OSError:
+        return ""
+    count = 0
+    start = 0
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("- "):
+            count += 1
+            if count >= entries:
+                start = i
+                break
+    header = None
+    for j in range(start, -1, -1):
+        if lines[j].startswith("## "):
+            header = lines[j]
+            break
+    picked = lines[start:]
+    if header is not None and header not in picked:
+        picked = [header, ""] + picked
+    return "\n".join(picked).strip()
+
+
+def _ago(minutes: float) -> str:
+    if minutes < 90:
+        return f"{int(minutes)} min ago"
+    if minutes < 36 * 60:
+        return f"{minutes / 60:.0f} hours ago"
+    return f"{minutes / 1440:.0f} days ago"
+
+
 def journal_cmd(argv: list[str]) -> None:
     """`claude-pair journal [N]` — show the last N journal lines (default 25)."""
     n = int(argv[0]) if argv and argv[0].isdigit() else 25
@@ -868,6 +909,22 @@ def watch(args: argparse.Namespace) -> None:
     returned_minutes: float | None = None
     have_client = False
     first_analysis = True
+
+    # fresh start after a long gap (Monday morning, back from lunch):
+    # show where the journal left off right away, before any activity,
+    # and greet the first real snapshot with a recap
+    journal_age = journal_age_minutes()
+    if away_secs > 0 and journal_age is not None and journal_age * 60 >= away_secs:
+        section = journal_last_section()
+        if section:
+            printer.console.print()
+            printer.console.print(Rule(
+                title=f"[bold cyan]✻[/] [dim]where you left off "
+                      f"({_ago(journal_age)})[/]",
+                style="cyan", align="left",
+            ))
+            printer.console.print(Markdown(section))
+            returned_minutes = journal_age
 
     # journal-stretch bookkeeping: summarize on break, checkpoint, and exit
     last_journal_wall = time.time()
