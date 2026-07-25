@@ -282,10 +282,13 @@ from its memory of your last snapshots before the break. Tune with
 
 This also works across restarts: **open claude-pair fresh on Monday morning**
 (or after a few hours away) and, if the journal's last entry is older than
-the `--away` threshold, it immediately prints a *"✻ where you left off
-(2 days ago)"* section with your last few journal entries — instantly, before
-any activity, no API call. Your first real snapshot then gets a synthesized
-recap on top, grounded in the journal plus whatever's on screen now.
+the `--away` threshold, it greets you with a *"✻ where you left off
+(2 days ago)"* brief — a couple of lines summarizing your recent journal
+(what you were doing, where you stopped, the obvious next step), written by
+one small API call over the journal tail. That call doubles as a prompt-cache
+pre-warm, so your first real suggestion is faster and cheaper. If the call
+can't be made (offline, no key yet), it falls back to printing the raw
+journal tail and lets your first snapshot carry a model recap instead.
 
 Away time is measured by your last real tmux keypress (`#{client_activity}`),
 so background output landing in a pane while you're gone doesn't count as

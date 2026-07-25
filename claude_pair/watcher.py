@@ -785,6 +785,37 @@ class Suggester:
             journal_append(entry)
             self.printer.banner("✎ journal updated")
 
+    def startup_brief(self, journal_text: str, age_minutes: float) -> str | None:
+        """Summarize the journal tail into a short 'where you left off'.
+
+        Also pre-warms the prompt cache (system prompt + contexts) for the
+        first real suggestion. Returns None on any failure — callers fall
+        back to printing the raw journal tail.
+        """
+        request = (
+            "<journal_request>\nThe user just reopened claude-pair after "
+            f"being away ({_ago(age_minutes)}). From their journal below, "
+            "write a 'where you left off' brief: 2-3 short lines — what "
+            "they were working on, where they left off, and the obvious "
+            "next step. Simple markdown bullets, no headers, no preamble.\n\n"
+            f"{journal_text}\n</journal_request>"
+        )
+        try:
+            response = self.client.messages.create(
+                model=self.args.model,
+                max_tokens=400,
+                thinking={"type": "disabled"},
+                output_config={"effort": "low"},
+                system=self._system(),
+                messages=[{"role": "user", "content": request}],
+            )
+        except (self.anthropic.APIError, self.anthropic.APIConnectionError):
+            return None
+        text = "".join(
+            b.text for b in response.content if b.type == "text"
+        ).strip()
+        return text or None
+
     def _call(self) -> None:
         system = self._system()
 
@@ -964,8 +995,7 @@ def watch(args: argparse.Namespace) -> None:
     first_analysis = True
 
     # fresh start after a long gap (Monday morning, back from lunch):
-    # show where the journal left off right away, before any activity,
-    # and greet the first real snapshot with a recap
+    # summarize where the journal left off, right away, before any activity
     journal_age = journal_age_minutes()
     if away_secs > 0 and journal_age is not None and journal_age * 60 >= away_secs:
         section = journal_last_section()
@@ -976,8 +1006,20 @@ def watch(args: argparse.Namespace) -> None:
                       f"({_ago(journal_age)})[/]",
                 style="cyan", align="left",
             ))
-            printer.console.print(Markdown(section))
-            returned_minutes = journal_age
+            brief = None
+            if suggester is not None:
+                suggester.context_text = context_text
+                suggester.vim_context = vim_context
+                with printer.console.status("[dim]summarizing…[/]"):
+                    brief = suggester.startup_brief(journal_tail(40), journal_age)
+            if brief:
+                printer.console.print(Markdown(brief, code_theme=args.theme))
+                # already re-grounded; skip the first-snapshot return recap
+            else:
+                # offline / no key / dry-run: raw tail, and let the first
+                # snapshot carry the <returned> marker for a model recap
+                printer.console.print(Markdown(section))
+                returned_minutes = journal_age
 
     # journal-stretch bookkeeping: summarize on break, checkpoint, and exit
     last_journal_wall = time.time()
