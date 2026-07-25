@@ -73,7 +73,7 @@ point your plugin manager at this repo:
 
 ```vim
 " vim-plug
-Plug 'you/tmux-claude-continuous', {'rtp': 'vim'}
+Plug 'mattjj/tmux-claude-pair', {'rtp': 'vim'}
 ```
 
 The plugin writes cursor/file/buffer state to
