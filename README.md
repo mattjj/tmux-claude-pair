@@ -340,6 +340,19 @@ so background output landing in a pane while you're gone doesn't count as
 "you're back" — and it's wall-clock based, so suspending your laptop counts
 as being away.
 
+### Remembering the keys
+
+Three layers, so you never have to memorize anything:
+
+- **Under each suggestion**, a dim contextual hint names exactly the keys
+  that apply to it: `⌨ ca applies this diff · cs full · ch keys` (a diff)
+  vs `⌨ cl pastes this code …` (code). `--no-hints` turns it off.
+- **In vim:** `:ClaudeKeys` (`<leader>ch`) opens a cheatsheet showing your
+  *actual* mappings — resolved live from vim's mapping table, so remaps
+  and custom leaders display truthfully, not the defaults.
+- **In the shell:** `claude-pair keys` prints the full cheatsheet — vim
+  keys, every subcommand, and the tmux toggle binding.
+
 ## Tips
 
 - **Terminal question → code in your buffer.** Type

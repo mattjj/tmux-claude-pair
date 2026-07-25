@@ -1227,6 +1227,13 @@ class Suggester:
             self.printer.tick()
         else:
             self._save_suggestion(reply)
+            if self.args.hints:
+                if extract_diff(reply).strip():
+                    self.printer.banner("⌨ ca applies this diff · cs full · ch keys")
+                elif extract_code(reply).strip():
+                    self.printer.banner("⌨ cl pastes this code · cs full · ch keys")
+                else:
+                    self.printer.banner("⌨ cs full · good/bad to rate · ch keys")
             if self.args.notify:
                 notify_status(self.own_pane, summarize(reply))
 
@@ -1306,9 +1313,14 @@ def watch(args: argparse.Namespace) -> None:
         f"debounce={args.debounce}s)"
     )
     printer.banner(
-        "talk to me: type here + Enter, run `claude-pair say ...`, "
-        "or type `# claude: ...` in your shell"
+        "talk: type here + Enter · claude-pair say · `# claude: ...` at your "
+        "prompt · visual <leader>cq in vim"
     )
+    printer.banner(
+        "keys: cl paste · ca apply diff · cs show · "
+        "`claude-pair keys` for the full cheatsheet"
+    )
+
     if not args.dry_run and not (
         os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     ):
@@ -1601,6 +1613,51 @@ def context_cmd(argv: list[str]) -> None:
         sys.exit("usage: claude-pair context [add <path>... | clear | list]")
 
 
+def keys_cmd() -> None:
+    """`claude-pair keys` — the full keybinding / command cheatsheet."""
+    console = Console(highlight=False)
+    from rich.table import Table
+
+    vim = Table(title="vim (defaults — :ClaudeKeys shows your actual maps)",
+                title_style="dim", title_justify="left",
+                show_header=False, show_edge=False, pad_edge=False)
+    vim.add_column(style="bold cyan")
+    vim.add_column()
+    for key, desc in (
+        ("<leader>cl", "paste last suggestion's code at cursor"),
+        ("<leader>ca", "apply last diff to buffer (:ClaudeApply! forces)"),
+        ("<leader>cq", "ask about selection (visual mode)"),
+        ("<leader>cc", "send whole file as reference context"),
+        ("<leader>cs", "show full last suggestion"),
+        ("<leader>ch", "keybinding cheatsheet in vim"),
+    ):
+        vim.add_row(key, desc)
+
+    shell = Table(title="shell", title_style="dim", title_justify="left",
+                  show_header=False, show_edge=False, pad_edge=False)
+    shell.add_column(style="bold cyan")
+    shell.add_column()
+    for cmd, desc in (
+        ('claude-pair say "..."', "ask directly (# claude: ... at the prompt too)"),
+        ("claude-pair last [--code]", "recall last suggestion / just its code"),
+        ("claude-pair good/bad [..]", "rate the last suggestion"),
+        ("claude-pair hide|show|toggle", "stash/restore the pane (keeps running)"),
+        ("claude-pair context add|list|clear", "manage loaded reference context"),
+        ("claude-pair journal | standup | costs", "activity log · standup · spend"),
+        ("claude-pair update", "pull latest + reinstall + PlugUpdate"),
+    ):
+        shell.add_row(cmd, desc)
+
+    console.print(vim)
+    console.print()
+    console.print(shell)
+    console.print()
+    console.print(
+        'tmux: bind h run-shell "claude-pair toggle"  (one-key hide/show)',
+        style="dim",
+    )
+
+
 def feedback_cmd(rating: str, words: list[str]) -> None:
     """`claude-pair good|bad [comment]` — steer the session, log the vote."""
     comment = " ".join(words).strip()
@@ -1721,6 +1778,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "standup":
         standup_cmd(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "keys":
+        keys_cmd()
+        return
     if len(sys.argv) > 1 and sys.argv[1] in ("update", "--update"):
         update()
         return
@@ -1739,6 +1799,13 @@ def main() -> None:
         action="store_true",
         help="stay on the launch/--target pane instead of following the "
         "active pane as you move around",
+    )
+    parser.add_argument(
+        "--hints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="print a one-line keybinding hint under each suggestion "
+        "(default on; --no-hints disables)",
     )
     parser.add_argument(
         "--notify",

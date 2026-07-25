@@ -136,6 +136,65 @@ function! s:PasteLast() abort
   echo 'claude-pair: inserted ' . len(l:lines) . ' line(s)'
 endfunction
 
+" --- keybinding cheatsheet -------------------------------------------------
+
+let s:plug_descs = [
+      \ ['(ClaudePairLast)',    'paste last suggestion''s code at cursor'],
+      \ ['(ClaudePairApply)',   'apply last diff to buffer (:ClaudeApply! forces)'],
+      \ ['(ClaudePairAsk)',     'ask about selection (visual mode)'],
+      \ ['(ClaudePairContext)', 'send whole file as reference context'],
+      \ ['(ClaudePairShow)',    'show full last suggestion'],
+      \ ['(ClaudePairKeys)',    'this cheatsheet'],
+      \ ]
+let s:default_lhs = {
+      \ '(ClaudePairLast)': '<Leader>cl',    '(ClaudePairApply)': '<Leader>ca',
+      \ '(ClaudePairAsk)': '<Leader>cq',     '(ClaudePairContext)': '<Leader>cc',
+      \ '(ClaudePairShow)': '<Leader>cs',    '(ClaudePairKeys)': '<Leader>ch',
+      \ }
+
+function! s:LhsFor(plug) abort
+  " ask vim for the real mapping (survives user remaps); fall back to defaults
+  if exists('*maplist')
+    for l:m in maplist()
+      if stridx(get(l:m, 'rhs', ''), a:plug) >= 0 && stridx(l:m.lhs, '<Plug>') < 0
+        return l:m.lhs
+      endif
+    endfor
+  endif
+  return get(s:default_lhs, a:plug, '?')
+endfunction
+
+function! s:ShowKeys() abort
+  let l:lines = []
+  for [l:plug, l:desc] in s:plug_descs
+    call add(l:lines, printf('  %-12s %s', s:LhsFor(l:plug), l:desc))
+  endfor
+  let l:lines += ['',
+        \ '  shell:',
+        \ '  claude-pair say "..."      ask directly   (# claude: ... also works)',
+        \ '  claude-pair last [--code]  recall last suggestion / just its code',
+        \ '  claude-pair good/bad [..]  rate the last suggestion',
+        \ '  claude-pair hide|show|toggle · journal · standup · costs · keys',
+        \ ]
+  let l:existing = bufwinnr('claude-pair://keys')
+  if l:existing > 0
+    execute l:existing . 'wincmd w'
+    setlocal modifiable
+    silent %delete _
+  else
+    botright new
+    setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+    setlocal nonumber norelativenumber signcolumn=no
+    silent! file claude-pair://keys
+    nnoremap <silent> <buffer> q :close<CR>
+  endif
+  call setline(1, l:lines)
+  execute 'resize' min([len(l:lines) + 1, 14])
+  setlocal nomodifiable
+endfunction
+
+command! ClaudeKeys call s:ShowKeys()
+
 " --- ask about a visual selection ------------------------------------------
 
 function! s:AskSelection() abort range
@@ -257,6 +316,7 @@ nnoremap <silent> <Plug>(ClaudePairLast) :call <SID>PasteLast()<CR>
 nnoremap <silent> <Plug>(ClaudePairShow) :call <SID>ShowLast()<CR>
 nnoremap <silent> <Plug>(ClaudePairApply) :call <SID>ApplyDiff(0)<CR>
 xnoremap <silent> <Plug>(ClaudePairAsk) :<C-u>call <SID>AskSelection()<CR>
+nnoremap <silent> <Plug>(ClaudePairKeys) :call <SID>ShowKeys()<CR>
 if get(g:, 'claude_pair_default_mappings', 1)
   if !hasmapto('<Plug>(ClaudePairLast)') && empty(maparg('<Leader>cl', 'n'))
     nmap <Leader>cl <Plug>(ClaudePairLast)
@@ -269,5 +329,8 @@ if get(g:, 'claude_pair_default_mappings', 1)
   endif
   if !hasmapto('<Plug>(ClaudePairAsk)') && empty(maparg('<Leader>cq', 'x'))
     xmap <Leader>cq <Plug>(ClaudePairAsk)
+  endif
+  if !hasmapto('<Plug>(ClaudePairKeys)') && empty(maparg('<Leader>ch', 'n'))
+    nmap <Leader>ch <Plug>(ClaudePairKeys)
   endif
 endif
