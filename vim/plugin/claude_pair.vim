@@ -63,12 +63,24 @@ function! s:TrackRecent() abort
   call writefile([json_encode(s:recent)], s:recent_file)
 endfunction
 
+" a save is a completed action — signal the watcher so it looks promptly
+function! s:SaveEvent() abort
+  if !g:claude_pair_enabled || empty(expand('%')) || !empty(&buftype)
+    return
+  endif
+  if !isdirectory(s:state_dir)
+    call mkdir(s:state_dir, 'p')
+  endif
+  call writefile([localtime(), 'save', expand('%:p')], s:state_dir . '/editor_event')
+endfunction
+
 augroup ClaudePair
   autocmd!
   " CursorHold fires after 'updatetime' ms of idleness; consider
   " `set updatetime=1000` so state stays fresh while you pause.
   autocmd CursorHold,CursorHoldI,BufEnter,BufWritePost,InsertLeave * call s:WriteState()
   autocmd BufEnter,BufWritePost * call s:TrackRecent()
+  autocmd BufWritePost * call s:SaveEvent()
 augroup END
 
 command! ClaudePairToggle let g:claude_pair_enabled = !g:claude_pair_enabled
@@ -124,6 +136,88 @@ function! s:PasteLast() abort
   echo 'claude-pair: inserted ' . len(l:lines) . ' line(s)'
 endfunction
 
+" --- ask about a visual selection ------------------------------------------
+
+function! s:AskSelection() abort range
+  let l:question = input('ask claude: ')
+  redraw
+  if empty(l:question)
+    echo 'claude-pair: cancelled'
+    return
+  endif
+  let l:first = line("'<")
+  let l:last = line("'>")
+  let l:lines = getline(l:first, l:last)
+  let l:ft = empty(&filetype) ? '' : &filetype
+  let l:msg = [l:question, '',
+        \ 'About this selection from ' . expand('%:p')
+        \ . ' lines ' . l:first . '-' . l:last . ':',
+        \ '```' . l:ft] + l:lines + ['```']
+  let l:inbox = s:state_dir . '/inbox'
+  if !isdirectory(l:inbox)
+    call mkdir(l:inbox, 'p')
+  endif
+  call writefile(l:msg, l:inbox . '/msg-' . localtime() . str2nr(matchstr(reltimestr(reltime()), '\.\zs\d\{3}')) . '.txt')
+  echo 'claude-pair: asked about lines ' . l:first . '-' . l:last
+endfunction
+
+command! -range ClaudeAsk call s:AskSelection()
+
+" --- apply the latest suggestion's diff to this buffer ---------------------
+
+function! s:ApplyDiff(bang) abort
+  let l:file = s:state_dir . '/last_diff.txt'
+  if !filereadable(l:file) || join(readfile(l:file), '') =~# '^\s*$'
+    echo 'claude-pair: no diff in the last suggestion (<leader>cl pastes code)'
+    return
+  endif
+  let l:diff = readfile(l:file)
+  " refuse (without !) when the diff clearly targets a different file
+  let l:target = ''
+  for l:line in l:diff
+    let l:m = matchlist(l:line, '^+++ \%(b/\)\?\(\f\+\)')
+    if !empty(l:m)
+      let l:target = l:m[1]
+      break
+    endif
+  endfor
+  if !a:bang && !empty(l:target) && fnamemodify(l:target, ':t') !=# expand('%:t')
+    echohl WarningMsg
+    echo 'claude-pair: diff targets ' . l:target . ' but this is '
+          \ . expand('%:t') . ' — :ClaudeApply! to force'
+    echohl None
+    return
+  endif
+  let l:src = tempname() | let l:patch = tempname() | let l:out = tempname()
+  call writefile(getline(1, '$'), l:src)
+  call writefile(l:diff, l:patch)
+  let l:applied = 0
+  for l:strip in ['-p1', '-p0']
+    call system('patch -s --fuzz=3 ' . l:strip . ' -o ' . shellescape(l:out)
+          \ . ' ' . shellescape(l:src) . ' ' . shellescape(l:patch))
+    if v:shell_error == 0
+      let l:applied = 1
+      break
+    endif
+  endfor
+  if l:applied
+    let l:new = readfile(l:out)
+    let l:view = winsaveview()
+    silent %delete _
+    undojoin
+    call setline(1, l:new)
+    call winrestview(l:view)
+    echo 'claude-pair: diff applied (' . len(l:new) . ' lines; u undoes)'
+  else
+    echohl ErrorMsg
+    echo 'claude-pair: patch did not apply cleanly — buffer unchanged'
+    echohl None
+  endif
+  call delete(l:src) | call delete(l:patch) | call delete(l:out)
+endfunction
+
+command! -bang ClaudeApply call s:ApplyDiff(<bang>0)
+
 " --- show the full latest suggestion in a scratch split --------------------
 
 function! s:ShowLast() abort
@@ -161,11 +255,19 @@ command! ClaudeLastShow call s:ShowLast()
 
 nnoremap <silent> <Plug>(ClaudePairLast) :call <SID>PasteLast()<CR>
 nnoremap <silent> <Plug>(ClaudePairShow) :call <SID>ShowLast()<CR>
+nnoremap <silent> <Plug>(ClaudePairApply) :call <SID>ApplyDiff(0)<CR>
+xnoremap <silent> <Plug>(ClaudePairAsk) :<C-u>call <SID>AskSelection()<CR>
 if get(g:, 'claude_pair_default_mappings', 1)
   if !hasmapto('<Plug>(ClaudePairLast)') && empty(maparg('<Leader>cl', 'n'))
     nmap <Leader>cl <Plug>(ClaudePairLast)
   endif
   if !hasmapto('<Plug>(ClaudePairShow)') && empty(maparg('<Leader>cs', 'n'))
     nmap <Leader>cs <Plug>(ClaudePairShow)
+  endif
+  if !hasmapto('<Plug>(ClaudePairApply)') && empty(maparg('<Leader>ca', 'n'))
+    nmap <Leader>ca <Plug>(ClaudePairApply)
+  endif
+  if !hasmapto('<Plug>(ClaudePairAsk)') && empty(maparg('<Leader>cq', 'x'))
+    xmap <Leader>cq <Plug>(ClaudePairAsk)
   endif
 endif

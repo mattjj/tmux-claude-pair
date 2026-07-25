@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from rich.console import Console
@@ -35,7 +35,39 @@ CACHE_DIR = (
 )
 VIM_STATE_FILE = CACHE_DIR / "vim_state.json"
 VIM_RECENT_FILE = CACHE_DIR / "vim_recent.json"  # ring of recent vim files
+SHELL_EVENT_FILE = CACHE_DIR / "shell_event"  # fish hook: command finished
+EDITOR_EVENT_FILE = CACHE_DIR / "editor_event"  # vim hook: file saved
 VIM_STATE_MAX_AGE = 120  # seconds before vim state is considered stale
+
+# redact obvious secret material from anything sent to the API: the pane
+# can show `cat .env` output, tokens in error traces, pasted creds, etc.
+SECRET_PATTERNS = [
+    re.compile(r"\bsk-(?:ant|proj|live|test)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+        re.DOTALL,
+    ),
+    # KEY=value / key: "value" assignments where the name screams secret
+    re.compile(
+        r"""(?ix)\b([A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|API_?KEY|PRIVATE_?KEY)
+            [A-Z0-9_]*\s*[=:]\s*)(['"]?)[^\s'"]{8,}\2"""
+    ),
+]
+
+
+def scrub_secrets(text: str) -> str:
+    for pattern in SECRET_PATTERNS:
+        if pattern.groups:
+            text = pattern.sub(r"\1[redacted]", text)
+        else:
+            text = pattern.sub("[redacted]", text)
+    return text
+
 
 # never auto-load files whose names suggest secrets; explicit
 # `claude-pair context add` remains available for deliberate loading
@@ -47,6 +79,7 @@ SENSITIVE_NAME_RE = re.compile(
 INBOX_DIR = CACHE_DIR / "inbox"  # `claude-pair say` drops messages here
 LAST_SUGGESTION_FILE = CACHE_DIR / "last_suggestion.txt"
 LAST_CODE_FILE = CACHE_DIR / "last_code.txt"  # just the fenced code blocks
+LAST_DIFF_FILE = CACHE_DIR / "last_diff.txt"  # just the ```diff fences
 SUGGESTION_LOG = CACHE_DIR / "suggestions.log"
 DATA_DIR = (
     Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
@@ -54,6 +87,7 @@ DATA_DIR = (
 )
 JOURNAL_FILE = DATA_DIR / "journal.md"  # running human-readable activity log
 USAGE_FILE = DATA_DIR / "usage.jsonl"  # one line per API call, for `costs`
+FEEDBACK_FILE = DATA_DIR / "feedback.jsonl"  # good/bad votes, for tuning
 
 # $/MTok (input, output); cache write bills 1.25x input, cache read 0.1x.
 # Estimates only — the Console is authoritative.
@@ -80,7 +114,10 @@ You are an expert pair programmer quietly looking over the user's shoulder. \
 Each user message is a snapshot of their terminal pane (and, when they are in \
 vim, the region of the file around their cursor, including unsaved edits). \
 Snapshots arrive whenever the screen changes and then goes briefly quiet — so \
-you often see half-typed commands and code mid-edit. The watcher follows the \
+you often see half-typed commands and code mid-edit. A <last_command> block, \
+when present, is a precise signal from the user's shell: that exact command \
+just finished with that exit status and duration. A nonzero status usually \
+deserves a suggestion; a routine success usually doesn't. The watcher follows the \
 user's active tmux pane, so consecutive snapshots may come from different \
 panes or windows — the pane id is in the <terminal> tag. A pane switch is \
 not itself worth commenting on.
@@ -124,6 +161,12 @@ someone who has lost their mental context, not a continuation. If you have \
 no pre-break snapshots to draw on, just say you're watching again and skip \
 the recap.
 
+A <user_message> starting with "FEEDBACK good" or "FEEDBACK bad" is \
+meta-feedback about your recent suggestions, not a question. Take it on \
+board for the rest of the session — recalibrate what you surface and how — \
+and reply with just SKIP. Never re-answer the original topic, never defend \
+or explain yourself.
+
 The user can also talk to you directly:
 - A <user_message> block in a snapshot is the user addressing you. Always \
 answer it — never SKIP a snapshot that contains one. Be concise but complete; \
@@ -154,6 +197,12 @@ editor or run goes inside a fenced block, ready to use as-is; explanation \
 stays outside. The user has commands that insert your latest fenced code \
 directly at their cursor, so never put prose, placeholders you haven't \
 flagged, or "..." elisions inside a fence.
+- To change an existing file (usually one visible in <vim> or \
+<vim_recent_files>), use a ```diff fence instead: a unified diff against \
+the saved file with `--- a/<path>` and `+++ b/<path>` headers and correct \
+hunk line numbers. The user applies it in vim with one keystroke \
+(:ClaudeApply), so it must apply cleanly. New standalone code still goes \
+in language fences.
 """
 
 
@@ -357,7 +406,10 @@ def _ago(minutes: float) -> str:
 
 
 def journal_cmd(argv: list[str]) -> None:
-    """`claude-pair journal [N]` — show the last N journal lines (default 25)."""
+    """`claude-pair journal [N | rollup]` — show the tail, or compress old weeks."""
+    if argv and argv[0] == "rollup":
+        rollup_journal()
+        return
     n = int(argv[0]) if argv and argv[0].isdigit() else 25
     console = Console(highlight=False)
     try:
@@ -366,6 +418,138 @@ def journal_cmd(argv: list[str]) -> None:
         sys.exit(f"claude-pair: no journal yet (will appear at {JOURNAL_FILE})")
     console.print(str(JOURNAL_FILE), style="dim")
     console.print(Markdown("\n".join(lines[-n:])))
+
+
+def _oneshot_client():
+    import anthropic
+
+    return anthropic, anthropic.Anthropic(), os.environ.get(
+        "CLAUDE_PAIR_MODEL", DEFAULT_MODEL
+    )
+
+
+def standup_cmd(argv: list[str]) -> None:
+    """`claude-pair standup [DAYS]` — a standup update from the journal."""
+    days = float(argv[0]) if argv and argv[0].replace(".", "").isdigit() else 3.0
+    try:
+        tail = "\n".join(JOURNAL_FILE.read_text().splitlines()[-200:]).strip()
+    except OSError:
+        sys.exit(f"claude-pair: no journal yet (will appear at {JOURNAL_FILE})")
+    if not tail:
+        sys.exit("claude-pair: journal is empty")
+    anthropic, client, model = _oneshot_client()
+    today = datetime.now().strftime("%A %Y-%m-%d")
+    request = (
+        f"Today is {today}. From the work journal below, write a standup "
+        f"update covering roughly the last {days:g} day(s) of entries: what "
+        "got done, what's in progress and where it left off, and any blockers "
+        "implied. 3-6 short markdown bullets, no headers, no preamble.\n\n"
+        f"{tail}"
+    )
+    console = Console(highlight=False)
+    try:
+        with console.status("[dim]summarizing…[/]"):
+            response = client.messages.create(
+                model=model, max_tokens=600,
+                thinking={"type": "disabled"},
+                output_config={"effort": "low"},
+                messages=[{"role": "user", "content": request}],
+            )
+    except (anthropic.APIError, anthropic.APIConnectionError) as exc:
+        sys.exit(f"claude-pair: standup call failed ({exc.__class__.__name__})")
+    log_usage("standup", model, response.usage)
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    console.print(Markdown(text))
+
+
+def rollup_journal() -> None:
+    """Compress journal entries older than 7 days into per-week summaries."""
+    try:
+        original = JOURNAL_FILE.read_text()
+    except OSError:
+        sys.exit(f"claude-pair: no journal yet (will appear at {JOURNAL_FILE})")
+
+    sections: list[tuple[str | None, list[str]]] = []
+    header: str | None = None
+    body: list[str] = []
+    for line in original.splitlines():
+        if line.startswith("## "):
+            sections.append((header, body))
+            header, body = line, []
+        else:
+            body.append(line)
+    sections.append((header, body))
+
+    cutoff = datetime.now().date() - timedelta(days=7)
+    plan: list[tuple[str, object]] = []  # ("week", key) | ("raw", section)
+    weeks: dict[tuple, dict] = {}
+    for head, lines in sections:
+        day = None
+        if head:
+            try:
+                day = datetime.strptime(head[3:].strip(), "%Y-%m-%d").date()
+            except ValueError:
+                day = None
+        if day and day < cutoff:
+            key = day.isocalendar()[:2]
+            if key not in weeks:
+                weeks[key] = {"start": day - timedelta(days=day.weekday()),
+                              "chunks": []}
+                plan.append(("week", key))
+            weeks[key]["chunks"].append(head + "\n" + "\n".join(lines))
+        else:
+            plan.append(("raw", (head, lines)))
+
+    console = Console(highlight=False)
+    if not weeks:
+        console.print("nothing older than 7 days to roll up", style="dim")
+        return
+
+    anthropic, client, model = _oneshot_client()
+    summaries: dict[tuple, str] = {}
+    for key, info in weeks.items():
+        request = (
+            "Condense this week's work-journal entries into 2-4 high-level "
+            "bullet lines. Keep anything still relevant later: decisions, "
+            "outcomes, left-off states. Output only the bullets.\n\n"
+            + "\n\n".join(info["chunks"])
+        )
+        try:
+            with console.status(f"[dim]rolling up week of {info['start']}…[/]"):
+                response = client.messages.create(
+                    model=model, max_tokens=400,
+                    thinking={"type": "disabled"},
+                    output_config={"effort": "low"},
+                    messages=[{"role": "user", "content": request}],
+                )
+        except (anthropic.APIError, anthropic.APIConnectionError) as exc:
+            sys.exit(
+                f"claude-pair: rollup call failed ({exc.__class__.__name__}); "
+                "journal unchanged"
+            )
+        log_usage("rollup", model, response.usage)
+        summaries[key] = "".join(
+            b.text for b in response.content if b.type == "text"
+        ).strip()
+
+    backup = JOURNAL_FILE.with_suffix(".md.bak")
+    backup.write_text(original)
+    parts: list[str] = []
+    for kind, value in plan:
+        if kind == "week":
+            info = weeks[value]
+            parts.append(
+                f"## Week of {info['start']} (rollup)\n\n{summaries[value]}\n"
+            )
+        else:
+            head, lines = value
+            segment = "\n".join(([head] if head else []) + lines).strip("\n")
+            if segment.strip():
+                parts.append(segment + "\n")
+    JOURNAL_FILE.write_text("\n" + "\n".join(parts))
+    console.print(
+        f"rolled up {len(weeks)} week(s); previous journal saved to {backup}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +853,7 @@ def build_vim_context(limit: int, budget: int) -> str:
         text = _read_text_file(p)
         if text is None:
             continue
-        chunk = f"=== {p} ===\n{text}\n"
+        chunk = f"=== {p} ===\n{scrub_secrets(text)}\n"
         if used + len(chunk) > budget:
             skipped.append(p.name)
             continue
@@ -687,6 +871,31 @@ def build_vim_context(limit: int, budget: int) -> str:
         + "\n".join(parts)
         + "</vim_recent_files>"
     )
+
+
+def event_ts(path: Path) -> int:
+    """Timestamp on an event file's first line, or 0."""
+    try:
+        return int(path.read_text().split("\n", 1)[0])
+    except (OSError, ValueError):
+        return 0
+
+
+def read_shell_event(after_ts: int) -> dict | None:
+    """A finished-command event newer than after_ts, from the fish hook."""
+    try:
+        lines = SHELL_EVENT_FILE.read_text().splitlines()
+        ts, status, duration = int(lines[0]), int(lines[1]), int(lines[2])
+    except (OSError, ValueError, IndexError):
+        return None
+    if ts <= after_ts:
+        return None
+    return {
+        "ts": ts,
+        "status": status,
+        "duration": duration,
+        "cmd": "\n".join(lines[3:]).strip(),
+    }
 
 
 def read_vim_state() -> dict | None:
@@ -739,6 +948,7 @@ def build_snapshot(
     pane: str = "",
     returned_minutes: float | None = None,
     journal: str = "",
+    shell_event: dict | None = None,
 ) -> str:
     parts = []
     if returned_minutes is not None:
@@ -747,10 +957,21 @@ def build_snapshot(
         parts.append(f"<journal_recent>\n{journal}\n</journal_recent>")
     for msg in user_messages or []:
         parts.append(f"<user_message>\n{msg}\n</user_message>")
-    parts.append(f'<terminal pane="{pane}">\n{pane_text}\n</terminal>')
+    if shell_event:
+        parts.append(
+            '<last_command status="{st}" duration="{dur}s">\n{cmd}\n'
+            "</last_command>".format(
+                st=shell_event["status"],
+                dur=shell_event["duration"],
+                cmd=scrub_secrets(shell_event["cmd"]),
+            )
+        )
+    parts.append(
+        f'<terminal pane="{pane}">\n{scrub_secrets(pane_text)}\n</terminal>'
+    )
     if vim_state and vim_state.get("context"):
         first = vim_state.get("first_line", 1)
-        lines = vim_state["context"]
+        lines = scrub_secrets("\n".join(vim_state["context"])).splitlines()
         numbered = "\n".join(
             f"{first + i:>5} {line}" for i, line in enumerate(lines)
         )
@@ -1025,29 +1246,45 @@ class Suggester:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             LAST_SUGGESTION_FILE.write_text(entry)
             LAST_CODE_FILE.write_text(extract_code(reply))
+            LAST_DIFF_FILE.write_text(extract_diff(reply))
             with SUGGESTION_LOG.open("a") as log:
                 log.write(entry + "\n")
         except OSError:
             pass  # persistence is best-effort; never break the watcher
 
 
-def extract_code(reply: str) -> str:
-    """The contents of all fenced code blocks, blank-line separated."""
-    blocks: list[str] = []
+def _split_fences(reply: str) -> list[tuple[str, str]]:
+    """All fenced blocks as (language, contents) pairs."""
+    blocks: list[tuple[str, str]] = []
     current: list[str] = []
+    lang = ""
     in_fence = False
     for line in reply.splitlines():
-        if line.lstrip().startswith("```"):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
             if in_fence:
-                blocks.append("\n".join(current))
+                blocks.append((lang, "\n".join(current)))
                 current = []
+            else:
+                lang = stripped[3:].strip().lower()
             in_fence = not in_fence
             continue
         if in_fence:
             current.append(line)
     if in_fence and current:  # unclosed fence (response cut short)
-        blocks.append("\n".join(current))
-    blocks = [b for b in blocks if b.strip()]
+        blocks.append((lang, "\n".join(current)))
+    return [(l, t) for l, t in blocks if t.strip()]
+
+
+def extract_code(reply: str) -> str:
+    """Fenced code blocks (diffs excluded — those go to last_diff.txt)."""
+    blocks = [t for l, t in _split_fences(reply) if l != "diff"]
+    return "\n\n".join(blocks) + "\n" if blocks else ""
+
+
+def extract_diff(reply: str) -> str:
+    """The contents of ```diff fences, for :ClaudeApply."""
+    blocks = [t for l, t in _split_fences(reply) if l == "diff"]
     return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
@@ -1156,6 +1393,12 @@ def watch(args: argparse.Namespace) -> None:
                 printer.console.print(Markdown(section))
                 returned_minutes = journal_age
 
+    # precise completion signals from the fish/vim hooks (ignore stale ones)
+    last_shell_ts = event_ts(SHELL_EVENT_FILE)
+    last_editor_ts = event_ts(EDITOR_EVENT_FILE)
+    shell_event: dict | None = None
+    force_analysis = False
+
     # journal-stretch bookkeeping: summarize on break, checkpoint, and exit
     last_journal_wall = time.time()
     suggest_calls = 0
@@ -1236,6 +1479,19 @@ def watch(args: argparse.Namespace) -> None:
                 nfiles = len(read_recent_vim_files(args.vim_files))
                 printer.banner(f"→ vim context: {nfiles} recent file(s)")
 
+        # hook events: a finished command rides along in the next snapshot
+        # (a failure analyzes immediately); a vim save analyzes promptly too
+        new_shell = read_shell_event(last_shell_ts)
+        if new_shell:
+            last_shell_ts = new_shell["ts"]
+            shell_event = new_shell
+            if new_shell["status"] != 0:
+                force_analysis = True
+        editor_ts = event_ts(EDITOR_EVENT_FILE)
+        if editor_ts > last_editor_ts:
+            last_editor_ts = editor_ts
+            force_analysis = True
+
         # direct messages jump the queue: no debounce, no cooldown
         direct = poll_inbox()
         while not stdin_inbox.empty():
@@ -1255,7 +1511,9 @@ def watch(args: argparse.Namespace) -> None:
         cooled = now - last_call_at >= args.cooldown
         pane_is_new = digest != analyzed_hash
 
-        if direct or (pane_is_new and settled and cooled):
+        # hook events skip the debounce (the "did it settle?" guess) but
+        # respect the cooldown; direct messages skip both
+        if direct or (cooled and (force_analysis or (pane_is_new and settled))):
             analyzed_hash = digest
             last_call_at = now
             # journal tail rides along only when memory is missing: the first
@@ -1265,7 +1523,10 @@ def watch(args: argparse.Namespace) -> None:
                 pane_text, read_vim_state(), direct, pane=target,
                 returned_minutes=returned_minutes,
                 journal=journal_tail() if include_journal else "",
+                shell_event=shell_event,
             )
+            shell_event = None
+            force_analysis = False
             returned_minutes = None
             first_analysis = False
             if args.dry_run:
@@ -1338,6 +1599,33 @@ def context_cmd(argv: list[str]) -> None:
             print(f"{head}  ({f.stat().st_size} chars)")
     else:
         sys.exit("usage: claude-pair context [add <path>... | clear | list]")
+
+
+def feedback_cmd(rating: str, words: list[str]) -> None:
+    """`claude-pair good|bad [comment]` — steer the session, log the vote."""
+    comment = " ".join(words).strip()
+    message = f"FEEDBACK {rating}" + (f": {comment}" if comment else "")
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    (INBOX_DIR / f"msg-{time.time_ns()}.txt").write_text(message)
+
+    about = ""
+    try:  # first content line of the suggestion being rated
+        lines = LAST_SUGGESTION_FILE.read_text().strip().splitlines()
+        about = next((l for l in lines[1:] if l.strip()), "")[:160]
+    except OSError:
+        pass
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with FEEDBACK_FILE.open("a") as f:
+            f.write(json.dumps({
+                "ts": int(time.time()),
+                "rating": rating,
+                "comment": comment,
+                "about": about,
+            }) + "\n")
+    except OSError:
+        pass
+    print(f"claude-pair: noted ({rating}{': ' + comment if comment else ''})")
 
 
 def last(argv: list[str]) -> None:
@@ -1426,6 +1714,12 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "costs":
         costs_cmd(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] in ("good", "bad"):
+        feedback_cmd(sys.argv[1], sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "standup":
+        standup_cmd(sys.argv[2:])
         return
     if len(sys.argv) > 1 and sys.argv[1] in ("update", "--update"):
         update()

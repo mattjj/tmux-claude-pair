@@ -136,6 +136,40 @@ Three ways to ask it something directly (direct messages are always answered
 - **A shell comment in your work pane.** Type `# claude: how do I undo the
   last commit?` at the prompt — in fish that's a no-op comment, but the
   watcher sees it on screen and answers it once.
+- **A visual selection in vim.** Select lines, hit `<leader>cq`
+  (`:ClaudeAsk`), type your question at the prompt — the selection (with
+  file and line numbers) rides along with it.
+
+And you can talk *back*: `claude-pair good` / `claude-pair bad "too
+nitpicky"` rates the last suggestion. The model takes it on board for the
+rest of the session (silently — no reply), and every vote lands in
+`~/.local/share/claude-pair/feedback.jsonl` with the suggestion it was
+about, so the prompt can be tuned against your real preferences later.
+
+### Shell and editor hooks (recommended)
+
+Screen-scraping can only *guess* when a command finished; the hooks tell the
+watcher precisely:
+
+- **fish:** copy or symlink `fish/conf.d/claude_pair.fish` into
+  `~/.config/fish/conf.d/`. Every finished command reports its exact
+  command line, exit status, and duration — a **failed command triggers a
+  suggestion immediately** (no debounce), and successes ride along as
+  context so Claude knows what actually ran.
+- **vim:** built into the plugin — every `:w` signals the watcher, so a
+  save (a completed action) is analyzed promptly instead of waiting out the
+  debounce.
+
+### Secrets are scrubbed
+
+Everything machine-gathered — pane text, vim buffer context, auto-loaded vim
+files — is scrubbed of obvious secret material before it's sent to the API:
+known key formats (`sk-ant-…`, `ghp_…`, `AKIA…`, `xox…`, JWTs), private-key
+PEM blocks, and `SECRET/TOKEN/PASSWORD/API_KEY`-style assignments with
+literal values all become `[redacted]`. So a stray `cat .env` doesn't ship
+your keys. (Manually loaded context via `claude-pair context add` is sent
+as-is — that's the deliberate escape hatch.) It's pattern-based, not
+perfect: an unusual token format can still slip through.
 
 ### Vim files are loaded automatically
 
@@ -201,7 +235,11 @@ told fences are the deliverable — paste-ready code, prose stays outside — so
 
 - **In vim:** `:ClaudeLast` (`<leader>cl`) pastes the code from the latest
   suggestion at your cursor and reports how many lines it inserted. Undo with
-  a single `u` as usual. `:ClaudeLastShow` (`<leader>cs`) opens the *full*
+  a single `u` as usual. When the suggestion is a *change to your file*, the
+  model emits a unified diff instead, and `:ClaudeApply` (`<leader>ca`)
+  applies it to the buffer via `patch(1)` — one `u` undoes, a diff that
+  doesn't apply cleanly leaves the buffer untouched, and a diff targeting a
+  different file is refused (`:ClaudeApply!` forces). `:ClaudeLastShow` (`<leader>cs`) opens the *full*
   suggestion — prose included — in a small markdown scratch split with
   syntax-highlighted code blocks (`q` closes it;
   `g:markdown_fenced_languages` defaults to `python, fish, sh, vim`). Set
@@ -261,6 +299,13 @@ level, one entry per work stretch, not a log of every command:
 It lives at `~/.local/share/claude-pair/journal.md` (a real file — grep it,
 edit it, keep it forever). `claude-pair journal` shows the tail
 (`claude-pair journal 50` for more).
+
+Two commands build on it: `claude-pair standup [days]` writes a standup
+update from the recent entries (what got done, what's in flight, blockers —
+default window 3 days, one API call), and `claude-pair journal rollup`
+compresses entries older than a week into per-week summary sections so the
+file stays skimmable over months (previous version saved to
+`journal.md.bak`).
 
 Entries are written at natural boundaries: when you **step away** (so the
 entry can say where you left off), every `--journal-every` minutes of
