@@ -326,6 +326,30 @@ model thinking, and model speed:
 Snappiest of all is just a faster model — `--model claude-haiku-4-5` is still
 Claude, and dramatically quicker for this kind of quick-take task.
 
+## Costs
+
+Every API call's exact token usage (reported by the API in each response) is
+logged to `~/.local/share/claude-pair/usage.jsonl`, along with an estimated
+cost and a locally computed reply class — no extra API calls, no added
+latency. Then:
+
+```sh
+claude-pair costs        # last 7 days
+claude-pair costs 30     # last 30
+```
+
+prints totals plus breakdowns **by call kind** (suggestions vs journal vs
+startup briefs), **by reply** (`skip`, `tip:python`, `tip:fish`, `answer`,
+…), and **by day**, with cache-read efficiency up top. Costs are estimates
+from a built-in price table — your Console usage page is authoritative.
+Logging starts when you first run this version; it can't reconstruct past
+spend.
+
+Typical shape to expect: most calls are SKIPs, and they still carry the
+(cached) input cost — so if spend feels high, the levers are fewer calls
+(`--debounce`/`--cooldown` up), less context (`--vim-files`,
+`--context-budget` down), or a cheaper model.
+
 ## Cost note
 
 Default settings call the API on every pause in activity, with Opus. With

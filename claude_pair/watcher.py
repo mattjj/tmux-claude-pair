@@ -53,6 +53,17 @@ DATA_DIR = (
     / "claude-pair"
 )
 JOURNAL_FILE = DATA_DIR / "journal.md"  # running human-readable activity log
+USAGE_FILE = DATA_DIR / "usage.jsonl"  # one line per API call, for `costs`
+
+# $/MTok (input, output); cache write bills 1.25x input, cache read 0.1x.
+# Estimates only — the Console is authoritative.
+PRICING_PER_MTOK = {
+    "claude-opus": (5.0, 25.0),
+    "claude-sonnet": (3.0, 15.0),
+    "claude-haiku": (1.0, 5.0),
+    "claude-fable": (10.0, 50.0),
+    "claude-mythos": (10.0, 50.0),
+}
 
 PANE_FILE = CACHE_DIR / "pane"  # the running watcher's own tmux pane id
 HIDDEN_WINDOW = "_claude_pair"  # holding window for a hidden watcher pane
@@ -159,6 +170,118 @@ def capture_pane(target: str, scrollback: int) -> str:
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "tmux capture-pane failed")
     return result.stdout.rstrip()
+
+
+# ---------------------------------------------------------------------------
+# usage accounting: log every call's token usage for `claude-pair costs`
+
+
+def estimate_cost_usd(model: str, rec: dict) -> float:
+    for prefix, (in_rate, out_rate) in PRICING_PER_MTOK.items():
+        if model.startswith(prefix):
+            break
+    else:
+        in_rate, out_rate = 5.0, 25.0
+    return (
+        rec["in"] * in_rate
+        + rec["cache_w"] * in_rate * 1.25
+        + rec["cache_r"] * in_rate * 0.10
+        + rec["out"] * out_rate
+    ) / 1e6
+
+
+def classify_reply(reply: str, direct: bool) -> str:
+    """Cheap local label: skip / tip / answer, tagged with fence languages."""
+    if not reply or reply.strip().upper() == "SKIP":
+        return "skip"
+    langs = sorted({m.lower() for m in re.findall(r"```(\w+)", reply)})
+    base = "answer" if direct else "tip"
+    return f"{base}:{'+'.join(langs)}" if langs else base
+
+
+def log_usage(kind: str, model: str, usage, extra: dict | None = None) -> None:
+    """Append one line to usage.jsonl. Best-effort, no API cost."""
+    try:
+        rec = {
+            "ts": int(time.time()),
+            "kind": kind,
+            "model": model,
+            "in": getattr(usage, "input_tokens", 0) or 0,
+            "out": getattr(usage, "output_tokens", 0) or 0,
+            "cache_w": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            "cache_r": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        }
+        rec.update(extra or {})
+        rec["usd"] = round(estimate_cost_usd(model, rec), 6)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with USAGE_FILE.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def costs_cmd(argv: list[str]) -> None:
+    """`claude-pair costs [DAYS]` — spend breakdown from usage.jsonl."""
+    days = float(argv[0]) if argv and argv[0].replace(".", "").isdigit() else 7.0
+    cutoff = time.time() - days * 86400
+    records = []
+    try:
+        with USAGE_FILE.open() as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("ts", 0) >= cutoff:
+                    records.append(rec)
+    except OSError:
+        sys.exit(f"claude-pair: no usage log yet (will appear at {USAGE_FILE})")
+    console = Console(highlight=False)
+    if not records:
+        console.print(f"no calls in the last {days:g} days", style="dim")
+        return
+
+    def agg(keyfn, by_key=False):
+        out: dict[str, list[float]] = {}
+        for r in records:
+            k = keyfn(r)
+            entry = out.setdefault(k, [0, 0.0])
+            entry[0] += 1
+            entry[1] += r.get("usd", 0.0)
+        key = (lambda kv: kv[0]) if by_key else (lambda kv: -kv[1][1])
+        return sorted(out.items(), key=key)
+
+    total_usd = sum(r.get("usd", 0.0) for r in records)
+    total_in = sum(r["in"] + r["cache_w"] + r["cache_r"] for r in records)
+    cached = sum(r["cache_r"] for r in records)
+    console.print(
+        f"[bold]claude-pair costs — last {days:g} days[/] "
+        f"[dim](estimates; Console is authoritative)[/]"
+    )
+    console.print(
+        f"{len(records)} calls · est [bold]${total_usd:.2f}[/] · "
+        f"{total_in:,} input tokens ({cached / max(1, total_in):.0%} cache reads) · "
+        f"{sum(r['out'] for r in records):,} output tokens"
+    )
+
+    from rich.table import Table
+
+    for title, keyfn, by_key in (
+        ("by call kind", lambda r: r.get("kind", "?"), False),
+        ("by reply", lambda r: r.get("class", "—"), False),
+        ("by day", lambda r: datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d"), True),
+    ):
+        table = Table(title=title, title_style="dim", title_justify="left",
+                      show_edge=False, pad_edge=False)
+        table.add_column("")
+        table.add_column("calls", justify="right")
+        table.add_column("est $", justify="right")
+        table.add_column("", justify="left", style="dim")
+        for key, (n, usd) in agg(keyfn, by_key):
+            share = usd / total_usd if total_usd else 0
+            table.add_row(key, str(n), f"{usd:.2f}", "▪" * int(share * 20))
+        console.print()
+        console.print(table)
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +901,7 @@ class Suggester:
             )
         except (self.anthropic.APIError, self.anthropic.APIConnectionError):
             return  # journaling is best-effort
+        log_usage("journal", self.args.model, response.usage)
         entry = " ".join(
             "".join(b.text for b in response.content if b.type == "text").split()
         ).strip("- ")
@@ -811,6 +935,7 @@ class Suggester:
             )
         except (self.anthropic.APIError, self.anthropic.APIConnectionError):
             return None
+        log_usage("brief", self.args.model, response.usage)
         text = "".join(
             b.text for b in response.content if b.type == "text"
         ).strip()
@@ -864,6 +989,16 @@ class Suggester:
         reply = "".join(
             block.text for block in final.content if block.type == "text"
         ).strip()
+
+        direct = bool(
+            self.messages and "<user_message>" in str(self.messages[-1]["content"])
+        )
+        log_usage(
+            "suggest",
+            self.args.model,
+            final.usage,
+            {"class": classify_reply(reply, direct)},
+        )
 
         if final.stop_reason == "refusal":
             self.printer.note("[claude declined to comment on this snapshot]")
@@ -1288,6 +1423,9 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "journal":
         journal_cmd(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "costs":
+        costs_cmd(sys.argv[2:])
         return
     if len(sys.argv) > 1 and sys.argv[1] in ("update", "--update"):
         update()
