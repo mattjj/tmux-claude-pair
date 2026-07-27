@@ -114,7 +114,11 @@ You are an expert pair programmer quietly looking over the user's shoulder. \
 Each user message is a snapshot of their terminal pane (and, when they are in \
 vim, the region of the file around their cursor, including unsaved edits). \
 Snapshots arrive whenever the screen changes and then goes briefly quiet — so \
-you often see half-typed commands and code mid-edit. A <last_command> block, \
+you often see half-typed commands and code mid-edit. When the pane is at a \
+shell prompt, ▏ marks the user's cursor: everything before it on that line \
+is really typed; anything that had been after it (like fish's gray \
+autosuggestion ghost) has been removed from the snapshot, so never treat \
+an autosuggestion as something the user wrote. A <last_command> block, \
 when present, is a precise signal from the user's shell: that exact command \
 just finished with that exit status and duration. A nonzero status usually \
 deserves a suggestion; a routine success usually doesn't. The watcher follows the \
@@ -210,15 +214,46 @@ in language fences.
 # tmux + vim context gathering
 
 
+SHELL_COMMANDS = {"fish", "bash", "zsh", "sh", "dash", "ksh", "nu"}
+
+
 def capture_pane(target: str, scrollback: int) -> str:
+    """Capture the pane, trimming the shell's autosuggestion ghost.
+
+    Fish renders its autosuggestion as gray text after the cursor; a plain
+    capture strips color, making the ghost indistinguishable from typed
+    input. When the pane is running a shell, we cut the cursor's line at
+    the cursor column and mark it with ▏ — the ghost (and only it, in the
+    common cursor-at-end case) disappears, and the model learns where the
+    cursor is. Panes running anything else (vim, pagers) are left intact.
+    """
     result = subprocess.run(
-        ["tmux", "capture-pane", "-p", "-J", "-t", target, "-S", f"-{scrollback}"],
+        ["tmux", "capture-pane", "-p", "-t", target, "-S", f"-{scrollback}"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "tmux capture-pane failed")
-    return result.stdout.rstrip()
+    text = result.stdout.rstrip()
+
+    info = _tmux(
+        "display-message", "-p", "-t", target,
+        "#{pane_current_command}\t#{pane_height}\t#{cursor_y}\t#{cursor_x}",
+    )
+    if info.returncode == 0:
+        try:
+            command, height, cur_y, cur_x = info.stdout.strip().split("\t")
+            height, cur_y, cur_x = int(height), int(cur_y), int(cur_x)
+        except ValueError:
+            return text
+        if command in SHELL_COMMANDS:
+            lines = text.split("\n")
+            idx = max(0, len(lines) - height) + cur_y
+            if 0 <= idx < len(lines):
+                line = lines[idx]
+                lines[idx] = line[: min(cur_x, len(line))] + "▏"
+                text = "\n".join(lines)
+    return text
 
 
 # ---------------------------------------------------------------------------

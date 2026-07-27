@@ -28,6 +28,11 @@ no-op), and pull the answer's code straight into vim with `<leader>cl`:
   in view. `--no-notify` turns it off.
 - Polls `tmux capture-pane` about once a second (visible screen + a little
   scrollback, so it sees the command line as you type it).
+- **Fish autosuggestions aren't mistaken for typing:** in shell panes the
+  snapshot is cut at your cursor (tmux knows its position) and marked with
+  `▏`, so the gray ghost text after the cursor never reaches the model —
+  and Claude knows exactly where your cursor is. Panes running vim or
+  pagers are left uncut.
 - When the pane content changes and then goes quiet for ~1.5s (debounced),
   it sends a snapshot to Claude, with a rolling conversation history so it
   remembers what it already told you.
