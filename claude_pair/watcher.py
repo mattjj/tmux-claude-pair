@@ -482,14 +482,14 @@ def standup_cmd(argv: list[str]) -> None:
         f"{tail}"
     )
     console = Console(highlight=False)
+    console.print("summarizing…", style="dim")
     try:
-        with console.status("[dim]summarizing…[/]"):
-            response = client.messages.create(
-                model=model, max_tokens=600,
-                thinking={"type": "disabled"},
-                output_config={"effort": "low"},
-                messages=[{"role": "user", "content": request}],
-            )
+        response = client.messages.create(
+            model=model, max_tokens=600,
+            thinking={"type": "disabled"},
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": request}],
+        )
     except (anthropic.APIError, anthropic.APIConnectionError) as exc:
         sys.exit(f"claude-pair: standup call failed ({exc.__class__.__name__})")
     log_usage("standup", model, response.usage)
@@ -549,14 +549,14 @@ def rollup_journal() -> None:
             "outcomes, left-off states. Output only the bullets.\n\n"
             + "\n\n".join(info["chunks"])
         )
+        console.print(f"rolling up week of {info['start']}…", style="dim")
         try:
-            with console.status(f"[dim]rolling up week of {info['start']}…[/]"):
-                response = client.messages.create(
-                    model=model, max_tokens=400,
-                    thinking={"type": "disabled"},
-                    output_config={"effort": "low"},
-                    messages=[{"role": "user", "content": request}],
-                )
+            response = client.messages.create(
+                model=model, max_tokens=400,
+                thinking={"type": "disabled"},
+                output_config={"effort": "low"},
+                messages=[{"role": "user", "content": request}],
+            )
         except (anthropic.APIError, anthropic.APIConnectionError) as exc:
             sys.exit(
                 f"claude-pair: rollup call failed ({exc.__class__.__name__}); "
@@ -1429,8 +1429,8 @@ def watch(args: argparse.Namespace) -> None:
             if suggester is not None:
                 suggester.context_text = context_text
                 suggester.vim_context = vim_context
-                with printer.console.status("[dim]summarizing…[/]"):
-                    brief = suggester.startup_brief(journal_tail(40), journal_age)
+                printer.banner("summarizing…")
+                brief = suggester.startup_brief(journal_tail(40), journal_age)
             if brief:
                 printer.console.print(Markdown(brief, code_theme=args.theme))
                 # already re-grounded; skip the first-snapshot return recap
